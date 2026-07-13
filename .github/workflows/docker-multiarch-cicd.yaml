@@ -42,7 +42,7 @@ jobs:
       pull-requests: write      # Write back to the Pull Request
     with:
       registry: ghcr.io
-      platforms: linux/amd64,linux/arm64
+      platforms: linux/amd64
       docker-compose-file-name: docker-compose.yaml
       docker-compose-target-service: mcp-shark
       dockerhub-registry: docker.io
