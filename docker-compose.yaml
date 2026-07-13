@@ -64,5 +64,60 @@ services:
       retries: 3
       start_period: 15s
 
-volumes:
-  mcp-shark-home:
+  sqlite-rest:
+    # PostgREST-style REST API over a SQLite file. Pinned upstream is :main
+    # (project publishes no semver tags); override via SQLITE_REST_IMAGE to pin
+    # a digest for reproducibility.
+    image: ${SQLITE_REST_IMAGE:-ghcr.io/b4fun/sqlite-rest/server:main}
+
+    # Upstream publishes linux/amd64 only; runs under emulation on arm64 hosts.
+    platform: linux/amd64
+
+    # Wait until mcp-shark is healthy so ./data/db/mcp-shark.sqlite exists with
+    # its schema — sqlite-rest validates --security-allow-table names at startup.
+    depends_on:
+      mcp-shark:
+        condition: service_healthy
+
+    # sqlite-rest REQUIRES an auth key (no run-without-auth mode). We derive an
+    # HS256 shared-secret file at startup from SQLITE_REST_TOKEN_SECRET so no
+    # secret is committed. Clients send a JWT signed with that secret as
+    # `Authorization: Bearer <jwt>`. Change the secret for anything non-local.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        printf '%s' "$${SQLITE_REST_TOKEN_SECRET}" > /tmp/sqlite-rest.token
+        exec sqlite-rest serve \
+          --db-dsn "$${SQLITE_REST_DB_DSN}" \
+          --http-addr ":8080" \
+          --auth-token-file /tmp/sqlite-rest.token \
+          --security-allow-table "$${SQLITE_REST_ALLOW_TABLES}"
+
+    environment:
+      # HS256 shared secret. LOCAL DEV DEFAULT — override in production/shared use.
+      #   Generate: openssl rand -hex 32
+      SQLITE_REST_TOKEN_SECRET: ${SQLITE_REST_TOKEN_SECRET:-mcp-shark-local-dev-secret-change-me}
+      # Same SQLite file mcp-shark writes, at its in-container mount path.
+      SQLITE_REST_DB_DSN: /data/db/mcp-shark.sqlite
+      # Tables/views exposed over REST (nothing is exposed by default upstream).
+      SQLITE_REST_ALLOW_TABLES: packets,conversations,sessions,security_findings,security_rules,rule_sources
+
+    ports:
+      - "${SQLITE_REST_PORT:-8080}:8080"
+
+    restart: unless-stopped
+
+    volumes:
+      # Read the SAME ./data the mcp-shark service writes. SQLite WAL mode allows
+      # concurrent readers while mcp-shark writes.
+      - ./data:/data
+
+    # No curl/wget in the image; bash /dev/tcp gives a dependency-free TCP probe.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
