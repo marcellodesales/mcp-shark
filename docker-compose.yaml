@@ -1,0 +1,77 @@
+####
+#### MCP Shark — proxy + browser dashboard (published CLI packaged for Docker).
+####
+#### This compose file wraps the public `@mcp-shark/mcp-shark` npm release. It
+#### does NOT build the JS/UI from local source — the Dockerfile installs the
+#### published package. This mirrors how the kortex platform deploys the
+#### upstream MCP Inspector image (see kortex env/*/mcp-inspector/deployment.yaml).
+####
+#### Quickstart:
+####   docker compose up --build
+####   open http://localhost:9853
+####
+#### Pin a specific @mcp-shark/mcp-shark release without editing the Dockerfile:
+####   MCP_SHARK_VERSION=1.7.2 docker compose build
+####
+#### Change the host port (container always listens on 9853):
+####   UI_PORT=19853 docker compose up
+####
+#### Persistent state — mcps.json (upstream MCP inventory), captured traffic
+#### sqlite DB, downloaded rule packs, YARA rules — lives in the named volume
+#### `mcp-shark-home` mounted at /home/mcpshark/.mcp-shark. Removing that volume
+#### re-triggers the zero-touch first-boot flow described in the README.
+####
+services:
+  mcp-shark:
+    image: mcp-shark:${MCP_SHARK_VERSION:-local}
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MCP_SHARK_VERSION: ${MCP_SHARK_VERSION:-1.7.2}
+
+    # The `serve` subcommand starts the UI + proxy on UI_PORT (0.0.0.0).
+    # `--open` is intentionally omitted — open the dashboard from your host.
+    command: ["serve"]
+
+    ports:
+      # Host:Container — override the host side via UI_PORT env / .env file.
+      - "${UI_PORT:-9853}:9853"
+
+    restart: unless-stopped
+
+    # tini as PID 1 → clean SIGTERM propagation to the child `node server.js`
+    # process that `mcp-shark serve` spawns. Without it, docker stop waits the
+    # full grace period before SIGKILL.
+    init: true
+
+    environment:
+      # --- Server ---
+      # Port the UI + proxy binds inside the container. Must match EXPOSE and
+      # the container side of the port map above.
+      UI_PORT: "9853"
+
+      # Where mcps.json, the sqlite DB and rule packs live. Mounted volume.
+      MCP_SHARK_HOME: /home/mcpshark/.mcp-shark
+
+      # --- Logging ---
+      # trace | debug | info | warn | error (consola levels)
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+    volumes:
+      # Persistent config + captured traffic + rule packs. Wipe this volume to
+      # reset first-boot state (see zero-touch section in README.md).
+      - mcp-shark-home:/home/mcpshark/.mcp-shark
+
+    # Sensible healthcheck — the dashboard root serves the SPA once the UI is
+    # up. Uses node's built-in fetch so no extra binaries need to be installed.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9853/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  mcp-shark-home:
