@@ -1,0 +1,123 @@
+####
+#### MCP Shark — proxy + browser dashboard + SQLite REST API.
+####
+#### Two services, one shared on-disk state directory (./data, bind-mounted):
+####
+####   mcp-shark   — the published @mcp-shark/mcp-shark CLI in `serve` mode
+####                 (UI + proxy). Writes its SQLite traffic DB and config into
+####                 ./data (see layout below).
+####   sqlite-rest — ghcr.io/b4fun/sqlite-rest exposes a REST API over the SAME
+####                 SQLite file so the captured traffic / findings tables are
+####                 queryable over HTTP (JWT-authenticated).
+####
+#### On-disk layout under ./data (created by mcp-shark at first boot):
+####   ./data/db/mcp-shark.sqlite   — traffic, conversations, sessions, findings
+####   ./data/mcps.json             — upstream MCP inventory (when configured)
+####   ./data/rule-packs/*.json     — downloaded rule packs (after `update-rules`)
+####
+#### Quickstart:
+####   docker compose up --build
+####   open http://localhost:9853              # dashboard
+####   # REST API on http://localhost:8080 (JWT required — see sqlite-rest below)
+####
+#### Everything lives in ./data on the host, so you can inspect / back up / edit
+#### the same SQLite file your local (non-Docker) mcp-shark would use by pointing
+#### it there, or open ./data/db/mcp-shark.sqlite in any SQLite browser.
+####
+services:
+  mcp-shark:
+    image: mcp-shark:${MCP_SHARK_VERSION:-local}
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MCP_SHARK_VERSION: ${MCP_SHARK_VERSION:-1.7.2}
+
+    # `serve` starts the UI + proxy on UI_PORT (0.0.0.0). `--open` is omitted —
+    # containers can't spawn a host browser; open http://localhost:9853 yourself.
+    command: ["serve"]
+
+    ports:
+      - "${UI_PORT:-9853}:9853"
+
+    restart: unless-stopped
+
+    # tini as PID 1 → clean SIGTERM propagation to the `node server.js` child
+    # that `mcp-shark serve` spawns (fast `docker compose down`).
+    init: true
+
+    environment:
+      UI_PORT: "9853"
+      MCP_SHARK_HOME: /home/mcpshark/.mcp-shark
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+    volumes:
+      # Bind-mount the app home to a local ./data dir so all state lives in the
+      # working tree (DB at ./data/db/mcp-shark.sqlite, ./data/mcps.json, etc.).
+      - ./data:/home/mcpshark/.mcp-shark
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9853/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  sqlite-rest:
+    # PostgREST-style REST API over a SQLite file. Pinned upstream is :main
+    # (project publishes no semver tags); override via SQLITE_REST_IMAGE to pin
+    # a digest for reproducibility.
+    image: ${SQLITE_REST_IMAGE:-ghcr.io/b4fun/sqlite-rest/server:main}
+
+    # Upstream publishes linux/amd64 only; runs under emulation on arm64 hosts.
+    platform: linux/amd64
+
+    # Wait until mcp-shark is healthy so ./data/db/mcp-shark.sqlite exists with
+    # its schema — sqlite-rest validates --security-allow-table names at startup.
+    depends_on:
+      mcp-shark:
+        condition: service_healthy
+
+    # sqlite-rest REQUIRES an auth key (no run-without-auth mode). We derive an
+    # HS256 shared-secret file at startup from SQLITE_REST_TOKEN_SECRET so no
+    # secret is committed. Clients send a JWT signed with that secret as
+    # `Authorization: Bearer <jwt>`. Change the secret for anything non-local.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        printf '%s' "$${SQLITE_REST_TOKEN_SECRET}" > /tmp/sqlite-rest.token
+        exec sqlite-rest serve \
+          --db-dsn "$${SQLITE_REST_DB_DSN}" \
+          --http-addr ":8080" \
+          --auth-token-file /tmp/sqlite-rest.token \
+          --security-allow-table "$${SQLITE_REST_ALLOW_TABLES}"
+
+    environment:
+      # HS256 shared secret. LOCAL DEV DEFAULT — override in production/shared use.
+      #   Generate: openssl rand -hex 32
+      SQLITE_REST_TOKEN_SECRET: ${SQLITE_REST_TOKEN_SECRET:-mcp-shark-local-dev-secret-change-me}
+      # Same SQLite file mcp-shark writes, at its in-container mount path.
+      SQLITE_REST_DB_DSN: /data/db/mcp-shark.sqlite
+      # Tables/views exposed over REST (nothing is exposed by default upstream).
+      SQLITE_REST_ALLOW_TABLES: packets,conversations,sessions,security_findings,security_rules,rule_sources
+
+    ports:
+      - "${SQLITE_REST_PORT:-8080}:8080"
+
+    restart: unless-stopped
+
+    volumes:
+      # Read the SAME ./data the mcp-shark service writes. SQLite WAL mode allows
+      # concurrent readers while mcp-shark writes.
+      - ./data:/data
+
+    # No curl/wget in the image; bash /dev/tcp gives a dependency-free TCP probe.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

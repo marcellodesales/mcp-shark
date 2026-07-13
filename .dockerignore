@@ -1,0 +1,5 @@
+# The Dockerfile installs `@mcp-shark/mcp-shark` from the public npm registry —
+# nothing from the local checkout is copied into the image. Ignore everything
+# except the Dockerfile itself to keep the build context tiny and cache-friendly.
+*
+!Dockerfile
